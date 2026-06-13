@@ -16,7 +16,9 @@ DATABASE_URL = os.environ.get("DATABASE_URL_MIEMBROS", os.environ.get("DATABASE_
 # Tamaño del pool configurable por variable de entorno.
 # Plan básico Railway (~20-25 conexiones totales): dejar en 10 da margen.
 # Cuando escales a 400 clubes + plan mayor de Railway: subir POOL_MAX a 20.
-POOL_MAX = int(os.environ.get("POOL_MAX", 10))
+POOL_MAX = int(os.environ.get("POOL_MAX", 20))
+# Límite de clubs permitidos. Aumentar este valor cuando se actualice el plan.
+MAX_CLUBS = int(os.environ.get("MAX_CLUBS", 10))
 _pool = None
 
 def _crear_pool():
@@ -113,6 +115,17 @@ def crear_club():
     conn = None
     try:
         conn = get_conn(); cur = conn.cursor()
+        # ── Validar límite de clubs ─────────────────────────────────────────
+        cur.execute("SELECT COUNT(*) FROM clubs")
+        total_clubs = cur.fetchone()[0]
+        if total_clubs >= MAX_CLUBS:
+            return jsonify({
+                "error": (
+                    f"Límite de {MAX_CLUBS} clubs alcanzado. "
+                    "El sistema requiere una actualización de plan para registrar nuevos clubs. "
+                    "Contacte al administrador de IKA."
+                )
+            }), 403
         token = secrets.token_urlsafe(8)   # genera token único ej: "a3f9k2Xw"
         cur.execute("""INSERT INTO clubs
             (nombre,ciudad,estado,nombres_dueno,apellidos_dueno,cedula_dueno,telefono,direccion,password_hash,debe_cambiar_pass,token)
@@ -456,237 +469,45 @@ def health():
         release(conn)
 
 def init_db():
-    """Migraciones automáticas al arrancar. Crea todas las tablas si no existen."""
+    """Migraciones automáticas al arrancar. Se ejecuta una sola vez por deploy."""
     conn = None
     try:
         conn = get_conn(); cur = conn.cursor()
 
-        # ── 1. miembros ──────────────────────────────────────────────────────
-        cur.execute("""CREATE TABLE IF NOT EXISTS miembros (
-            id                SERIAL       PRIMARY KEY,
-            nombres           VARCHAR(100) NOT NULL,
-            apellidos         VARCHAR(100) NOT NULL,
-            cedula            VARCHAR(20)  NOT NULL UNIQUE,
-            telefono          VARCHAR(30),
-            direccion         VARCHAR(200),
-            correo            VARCHAR(150),
-            fecha_ingreso     DATE,
-            categoria         VARCHAR(100),
-            ciudad_nacimiento VARCHAR(100),
-            fecha_nacimiento  DATE,
-            genero            VARCHAR(20),
-            password_hash     VARCHAR(255) NOT NULL DEFAULT '',
-            debe_cambiar_pass BOOLEAN      NOT NULL DEFAULT TRUE,
-            ciudad_residencia VARCHAR(100),
-            club_id           INTEGER
+        # ── Tabla asistencia ────────────────────────────────────────────────
+        cur.execute("""CREATE TABLE IF NOT EXISTS asistencia (
+            id       SERIAL PRIMARY KEY,
+            club_id  INTEGER NOT NULL,
+            socio_id INTEGER NOT NULL,
+            fecha    DATE    NOT NULL,
+            estado   VARCHAR(20) NOT NULL DEFAULT 'sin_registro',
+            UNIQUE(club_id, socio_id, fecha)
         )""")
-        cur.execute("ALTER TABLE miembros ADD COLUMN IF NOT EXISTS ciudad_residencia VARCHAR(100)")
-        cur.execute("ALTER TABLE miembros ADD COLUMN IF NOT EXISTS club_id INTEGER")
 
-        # ── 2. clubs ─────────────────────────────────────────────────────────
-        cur.execute("""CREATE TABLE IF NOT EXISTS clubs (
-            id                SERIAL       PRIMARY KEY,
-            nombre            VARCHAR(200) NOT NULL,
-            ciudad            VARCHAR(100),
-            estado            VARCHAR(20)  NOT NULL DEFAULT 'activo',
-            fecha_solicitud   TIMESTAMP    NOT NULL DEFAULT NOW(),
-            cedula_dueno      VARCHAR(20)  NOT NULL UNIQUE,
-            nombres_dueno     VARCHAR(100) NOT NULL,
-            apellidos_dueno   VARCHAR(100) NOT NULL,
-            password_hash     VARCHAR(255) NOT NULL DEFAULT '',
-            debe_cambiar_pass BOOLEAN      NOT NULL DEFAULT TRUE,
-            telefono          VARCHAR(30)  NOT NULL DEFAULT '',
-            direccion         VARCHAR(200) NOT NULL DEFAULT '',
-            token             VARCHAR(20)
-        )""")
-        cur.execute("ALTER TABLE clubs ADD COLUMN IF NOT EXISTS telefono  VARCHAR(30)  NOT NULL DEFAULT ''")
-        cur.execute("ALTER TABLE clubs ADD COLUMN IF NOT EXISTS direccion VARCHAR(200) NOT NULL DEFAULT ''")
-        cur.execute("ALTER TABLE clubs ADD COLUMN IF NOT EXISTS token     VARCHAR(20)")
-        # FK club_id en miembros (ahora que clubs existe)
-        cur.execute("""ALTER TABLE miembros
-            ADD COLUMN IF NOT EXISTS club_id INTEGER REFERENCES clubs(id) ON DELETE SET NULL""")
-        # Genera tokens para clubs sin token
+        # ── Columna token en clubs ──────────────────────────────────────────
+        # Agrega la columna si no existe (clubs nuevos la reciben al crearse).
+        cur.execute("ALTER TABLE clubs ADD COLUMN IF NOT EXISTS token VARCHAR(20)")
+        # Genera tokens para clubs que ya existían antes de este deploy.
         cur.execute("""UPDATE clubs SET token = SUBSTR(MD5(cedula_dueno || id::text), 1, 11)
                        WHERE token IS NULL""")
+        # Agrega constraint único si todavía no existe.
         cur.execute("""DO $$ BEGIN
             IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'clubs_token_unique')
             THEN ALTER TABLE clubs ADD CONSTRAINT clubs_token_unique UNIQUE (token);
             END IF; END $$""")
 
-        # ── 3. categorias ────────────────────────────────────────────────────
-        cur.execute("""CREATE TABLE IF NOT EXISTS categorias (
-            id     SERIAL       PRIMARY KEY,
-            nombre VARCHAR(100) NOT NULL UNIQUE
-        )""")
+        # ── Columna telefono (contacto) en clubs ────────────────────────────
+        # Número de contacto del club. Clubs nuevos lo reciben al crearse;
+        # los antiguos quedan en cadena vacía hasta que el admin los edite.
+        cur.execute("ALTER TABLE clubs ADD COLUMN IF NOT EXISTS telefono VARCHAR(30) NOT NULL DEFAULT ''")
 
-        # ── 4. administradores ───────────────────────────────────────────────
-        cur.execute("""CREATE TABLE IF NOT EXISTS administradores (
-            id                SERIAL       PRIMARY KEY,
-            nombres           VARCHAR(100) NOT NULL,
-            apellidos         VARCHAR(100) NOT NULL,
-            cedula            VARCHAR(20)  NOT NULL UNIQUE,
-            telefono          VARCHAR(30),
-            direccion         VARCHAR(200),
-            correo            VARCHAR(150),
-            ciudad_nacimiento VARCHAR(100),
-            fecha_nacimiento  DATE,
-            genero            VARCHAR(20),
-            fecha_ingreso     DATE,
-            password_hash     VARCHAR(255) NOT NULL DEFAULT '',
-            debe_cambiar_pass BOOLEAN      NOT NULL DEFAULT TRUE,
-            creado_en         TIMESTAMP    NOT NULL DEFAULT NOW()
-        )""")
-
-        # ── 5. asistencia ────────────────────────────────────────────────────
-        cur.execute("""CREATE TABLE IF NOT EXISTS asistencia (
-            id       SERIAL      PRIMARY KEY,
-            club_id  INTEGER     NOT NULL,
-            socio_id INTEGER     NOT NULL,
-            fecha    DATE        NOT NULL,
-            estado   VARCHAR(20) NOT NULL DEFAULT 'sin_registro',
-            UNIQUE(club_id, socio_id, fecha)
-        )""")
-
-        # ── 6. historial ─────────────────────────────────────────────────────
-        cur.execute("""CREATE TABLE IF NOT EXISTS hist_plantillas (
-            id     SERIAL       PRIMARY KEY,
-            nombre VARCHAR(200) NOT NULL,
-            activa BOOLEAN      NOT NULL DEFAULT true
-        )""")
-        cur.execute("ALTER TABLE hist_plantillas ADD COLUMN IF NOT EXISTS activa BOOLEAN NOT NULL DEFAULT true")
-        cur.execute("""CREATE TABLE IF NOT EXISTS hist_campos (
-            id           SERIAL       PRIMARY KEY,
-            plantilla_id INTEGER      REFERENCES hist_plantillas(id) ON DELETE CASCADE,
-            orden        INTEGER      NOT NULL DEFAULT 0,
-            etiqueta     VARCHAR(200) NOT NULL,
-            tipo         VARCHAR(10)  NOT NULL DEFAULT 'texto'
-        )""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS hist_registros (
-            id           SERIAL    PRIMARY KEY,
-            socio_id     INTEGER   NOT NULL,
-            plantilla_id INTEGER   REFERENCES hist_plantillas(id),
-            creado_en    TIMESTAMP NOT NULL DEFAULT NOW()
-        )""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS hist_valores (
-            id          SERIAL  PRIMARY KEY,
-            registro_id INTEGER REFERENCES hist_registros(id) ON DELETE CASCADE,
-            campo_id    INTEGER REFERENCES hist_campos(id),
-            valor       TEXT
-        )""")
-
-        # ── 7. eventos ───────────────────────────────────────────────────────
-        cur.execute("""CREATE TABLE IF NOT EXISTS eventos (
-            id          SERIAL       PRIMARY KEY,
-            nombre      VARCHAR(200) NOT NULL,
-            fecha       DATE,
-            descripcion TEXT,
-            creado_en   TIMESTAMP    NOT NULL DEFAULT NOW()
-        )""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS evento_participantes (
-            id        SERIAL  PRIMARY KEY,
-            evento_id INTEGER NOT NULL REFERENCES eventos(id) ON DELETE CASCADE,
-            socio_id  INTEGER NOT NULL,
-            UNIQUE(evento_id, socio_id)
-        )""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS jerarquia_roles (
-            id             SERIAL       PRIMARY KEY,
-            evento_id      INTEGER      NOT NULL REFERENCES eventos(id) ON DELETE CASCADE,
-            socio_id       INTEGER      NOT NULL,
-            rol            VARCHAR(100),
-            coordinador_id INTEGER,
-            UNIQUE(evento_id, socio_id)
-        )""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS responsabilidades (
-            id           SERIAL      PRIMARY KEY,
-            evento_id    INTEGER     NOT NULL REFERENCES eventos(id) ON DELETE CASCADE,
-            socio_id     INTEGER     NOT NULL,
-            descripcion  TEXT        NOT NULL,
-            fecha_limite DATE,
-            estado       VARCHAR(30) NOT NULL DEFAULT 'pendiente'
-        )""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS checklist_items (
-            id                 SERIAL    PRIMARY KEY,
-            responsabilidad_id INTEGER   NOT NULL REFERENCES responsabilidades(id) ON DELETE CASCADE,
-            texto              TEXT      NOT NULL,
-            completado         BOOLEAN   NOT NULL DEFAULT false,
-            completado_en      TIMESTAMP
-        )""")
-
-        # ── 8. programas ─────────────────────────────────────────────────────
-        cur.execute("""CREATE TABLE IF NOT EXISTS programas (
-            id            SERIAL       PRIMARY KEY,
-            nombre        VARCHAR(200) NOT NULL,
-            descripcion   TEXT,
-            fecha_inicio  DATE         NOT NULL,
-            fecha_fin     DATE         NOT NULL,
-            dias_semana   VARCHAR(20)  NOT NULL,
-            horas_diarias NUMERIC(4,1) NOT NULL DEFAULT 1,
-            subcategoria  VARCHAR(200),
-            estado        VARCHAR(20)  NOT NULL DEFAULT 'activo',
-            creado_en     TIMESTAMP    NOT NULL DEFAULT NOW()
-        )""")
-        cur.execute("ALTER TABLE programas ADD COLUMN IF NOT EXISTS subcategoria VARCHAR(200)")
-        cur.execute("""CREATE TABLE IF NOT EXISTS programa_clubs (
-            id          SERIAL  PRIMARY KEY,
-            programa_id INTEGER NOT NULL REFERENCES programas(id) ON DELETE CASCADE,
-            club_id     INTEGER NOT NULL REFERENCES clubs(id)     ON DELETE CASCADE,
-            UNIQUE(programa_id, club_id)
-        )""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS programa_sesiones (
-            id          SERIAL  PRIMARY KEY,
-            programa_id INTEGER NOT NULL REFERENCES programas(id) ON DELETE CASCADE,
-            fecha       DATE    NOT NULL,
-            UNIQUE(programa_id, fecha)
-        )""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS programa_comentarios (
-            id          SERIAL      PRIMARY KEY,
-            programa_id INTEGER     NOT NULL REFERENCES programas(id) ON DELETE CASCADE,
-            club_id     INTEGER     NOT NULL REFERENCES clubs(id)     ON DELETE CASCADE,
-            socio_id    INTEGER     NOT NULL REFERENCES miembros(id)  ON DELETE CASCADE,
-            autor       VARCHAR(10) NOT NULL DEFAULT 'admin',
-            texto       TEXT        NOT NULL,
-            creado_en   TIMESTAMP   NOT NULL DEFAULT NOW()
-        )""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS programa_asistencias (
-            id          SERIAL  PRIMARY KEY,
-            programa_id INTEGER NOT NULL REFERENCES programas(id)        ON DELETE CASCADE,
-            sesion_id   INTEGER NOT NULL REFERENCES programa_sesiones(id) ON DELETE CASCADE,
-            socio_id    INTEGER NOT NULL,
-            asistio     BOOLEAN NOT NULL DEFAULT false,
-            UNIQUE(sesion_id, socio_id)
-        )""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS programa_inscriptos (
-            id          SERIAL  PRIMARY KEY,
-            programa_id INTEGER NOT NULL REFERENCES programas(id) ON DELETE CASCADE,
-            socio_id    INTEGER NOT NULL,
-            UNIQUE(programa_id, socio_id)
-        )""")
-
-        # ── 9. chat ───────────────────────────────────────────────────────────
-        cur.execute("""CREATE TABLE IF NOT EXISTS conversaciones (
-            id             SERIAL       PRIMARY KEY,
-            evento_id      INTEGER      REFERENCES eventos(id) ON DELETE CASCADE,
-            nombre_conv    VARCHAR(200),
-            tipo_conv      VARCHAR(20)  NOT NULL DEFAULT 'individual',
-            participante_a INTEGER,
-            participante_b INTEGER,
-            creado_en      TIMESTAMP    NOT NULL DEFAULT NOW()
-        )""")
-        cur.execute("""CREATE TABLE IF NOT EXISTS mensajes (
-            id              SERIAL       PRIMARY KEY,
-            conversacion_id INTEGER      NOT NULL REFERENCES conversaciones(id) ON DELETE CASCADE,
-            evento_id       INTEGER,
-            remitente_nombre VARCHAR(200),
-            destinatario_id INTEGER,
-            texto           TEXT         NOT NULL,
-            leido           BOOLEAN      NOT NULL DEFAULT false,
-            borrado         BOOLEAN      NOT NULL DEFAULT false,
-            borrado_en      TIMESTAMP,
-            creado_en       TIMESTAMP    NOT NULL DEFAULT NOW()
-        )""")
+        # ── Columna direccion en clubs ──────────────────────────────────────
+        # Dirección física del club. Clubs nuevos la reciben al crearse;
+        # los antiguos quedan en cadena vacía hasta que el admin los edite.
+        cur.execute("ALTER TABLE clubs ADD COLUMN IF NOT EXISTS direccion VARCHAR(200) NOT NULL DEFAULT ''")
 
         conn.commit()
-        logger.info("init_db: todas las tablas verificadas/creadas correctamente.")
+        logger.info("init_db: migraciones aplicadas correctamente.")
     except Exception as e:
         try: conn.rollback()
         except: pass
