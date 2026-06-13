@@ -114,6 +114,21 @@ async function registrarClub(){
       body:JSON.stringify({nombre:v('c-nombre'),ciudad:v('c-ciudad'),estado:v('c-estado'),
         nombres_dueno:v('c-nomb'),apellidos_dueno:v('c-apel'),cedula_dueno:v('c-ced'),telefono:v('c-tel'),direccion:v('c-dir')})});
     const res=await r.json();
+    if(r.status===403){
+      // Límite de clubs alcanzado — mostrar banner prominente además del toast
+      g('card-form').innerHTML=`
+        <div style="text-align:center;padding:24px 12px">
+          <div style="font-size:2.2rem;margin-bottom:10px">🚫</div>
+          <div style="font-size:1rem;font-weight:700;color:var(--err);margin-bottom:8px">Límite de clubs alcanzado</div>
+          <div style="font-size:.82rem;color:var(--ts);line-height:1.6;margin-bottom:18px">
+            El sistema ha alcanzado el máximo de clubs permitidos en el plan actual.<br>
+            Para registrar nuevos clubs es necesario actualizar el plan de servicio.<br><br>
+            <strong>Contacte al administrador de IKA.</strong>
+          </div>
+          <button class="btn" style="background:var(--p);max-width:220px;margin:0 auto" onclick="location.reload()">↩ Volver</button>
+        </div>`;
+      toast('🚫 '+res.error,'err',8000); return;
+    }
     if(r.ok){
       LINK_GENERADO=`${location.origin}/panel?club=${res.token}`;
       const waMsg=encodeURIComponent(`🥋 Hola! Aquí está tu link de acceso al portal IKA:\n${LINK_GENERADO}`);
